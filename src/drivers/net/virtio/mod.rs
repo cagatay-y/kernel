@@ -311,7 +311,7 @@ impl NetworkDriver for VirtioNetDriver {
 		// what we are about to add
 		self.send_vqs.poll();
 
-		assert!(len < usize::try_from(self.send_vqs.packet_length).unwrap());
+		assert!(len <= usize::try_from(self.send_vqs.packet_length).unwrap());
 		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
 		let result = unsafe {
 			let result = f(MaybeUninit::slice_assume_init_mut(
