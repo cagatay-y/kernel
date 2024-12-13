@@ -80,22 +80,35 @@ impl CtrlQueue {
 
 pub struct RxQueues {
 	vqs: Vec<Box<dyn Virtq>>,
-	packet_size: u32,
+	/// Length of the buffer to be placed in the receive queue excluding the virtio-net header.
+	payload_element_size: u32,
 }
 
 impl RxQueues {
+	/// Can be any value as long as it is larger than the size of the virtio-net header.
+	/// Chosen to be as small as possible to increase the likelihood of triggering any potential
+	/// issue related to buffer merging.
+	const MRG_RXBUF_SIZE: u32 = size_of::<virtio::net::Hdr>() as _;
+
 	pub fn new<T: Virtq + 'static>(
 		com_cfg: &mut ComCfg,
 		notif_cfg: &NotifCfg,
 		dev_cfg: &NetDevCfg,
 		virtqueue_pairs: u16,
+		mtu: u16,
 	) -> Self {
 		// See Virtio specification v1.1 - 5.1.6.3.1
-		//
-		let packet_size = if dev_cfg.features.contains(virtio::net::F::MRG_RXBUF) {
-			1514
+		let payload_element_size = if dev_cfg.features.contains(virtio::net::F::MRG_RXBUF) {
+			debug_assert!(
+				Self::MRG_RXBUF_SIZE >= size_of::<virtio::net::Hdr>().try_into().unwrap()
+			);
+			Self::MRG_RXBUF_SIZE
+		} else if dev_cfg.features.intersects(
+			virtio::net::F::GUEST_TSO4 | virtio::net::F::GUEST_TSO6 | virtio::net::F::GUEST_UFO,
+		) {
+			65550
 		} else {
-			dev_cfg.raw.as_ptr().mtu().read().to_ne().into()
+			mtu.into()
 		};
 
 		let mut vqs = Vec::with_capacity(virtqueue_pairs.into());
@@ -115,13 +128,16 @@ impl RxQueues {
 			const BUFF_PER_PACKET: u16 = 2;
 			// The actual size may be smaller than what we requested.
 			let num_packets = u16::from(vq.size()) / BUFF_PER_PACKET;
-			fill_queue(vq.as_mut(), num_packets, packet_size);
+			fill_queue(vq.as_mut(), num_packets, payload_element_size);
 			// Interrupt for receiving packets is wanted
 			vq.enable_notifs();
 			vqs.push(vq);
 		}
 
-		Self { vqs, packet_size }
+		Self {
+			vqs,
+			payload_element_size,
+		}
 	}
 
 	/// Takes care of handling packets correctly which need some processing after being received.
@@ -153,14 +169,15 @@ impl RxQueues {
 	}
 }
 
-fn fill_queue(vq: &mut dyn Virtq, num_packets: u16, packet_size: u32) {
+// `payload_element_size` is the size of the buffer to be placed _without_ the header.
+fn fill_queue(vq: &mut dyn Virtq, num_packets: u16, payload_element_size: u32) {
 	for _ in 0..num_packets {
 		let buff_tkn = match AvailBufferToken::new(
 			vec![],
 			vec![
 				BufferElem::Sized(Box::<Hdr, _>::new_uninit_in(DeviceAlloc)),
 				BufferElem::Vector(Vec::with_capacity_in(
-					packet_size.try_into().unwrap(),
+					payload_element_size.try_into().unwrap(),
 					DeviceAlloc,
 				)),
 			],
@@ -186,9 +203,6 @@ fn fill_queue(vq: &mut dyn Virtq, num_packets: u16, packet_size: u32) {
 /// to the respective queue structures.
 pub struct TxQueues {
 	vqs: Vec<Box<dyn Virtq>>,
-	/// Indicates, whether the Driver/Device are using multiple
-	/// queues for communication.
-	packet_length: u32,
 }
 
 impl TxQueues {
@@ -198,15 +212,6 @@ impl TxQueues {
 		dev_cfg: &NetDevCfg,
 		virtqueue_pairs: u16,
 	) -> Self {
-		let packet_length = if dev_cfg.features.contains(virtio::net::F::GUEST_TSO4)
-			| dev_cfg.features.contains(virtio::net::F::GUEST_TSO6)
-			| dev_cfg.features.contains(virtio::net::F::GUEST_UFO)
-		{
-			0x0001_000e
-		} else {
-			dev_cfg.raw.as_ptr().mtu().read().to_ne().into()
-		};
-
 		let mut vqs = Vec::with_capacity(virtqueue_pairs.into());
 		for i in 0..virtqueue_pairs {
 			let mut vq: Box<dyn Virtq> = Box::new(
@@ -225,7 +230,7 @@ impl TxQueues {
 			vqs.push(vq);
 		}
 
-		Self { vqs, packet_length }
+		Self { vqs }
 	}
 	#[allow(dead_code)]
 	fn enable_notifs(&mut self) {
@@ -311,7 +316,6 @@ impl NetworkDriver for VirtioNetDriver {
 		// what we are about to add
 		self.send_vqs.poll();
 
-		assert!(len <= usize::try_from(self.send_vqs.packet_length).unwrap());
 		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
 		let result = unsafe {
 			let result = f(MaybeUninit::slice_assume_init_mut(
@@ -376,7 +380,7 @@ impl NetworkDriver for VirtioNetDriver {
 		fill_queue(
 			self.recv_vqs.vqs[0].as_mut(),
 			num_buffers,
-			self.recv_vqs.packet_size,
+			self.recv_vqs.payload_element_size,
 		);
 
 		let vec_data = packets.into_iter().flatten().collect();
@@ -637,7 +641,8 @@ impl VirtioNetDriver {
 
 			// Device Specific initialization according to Virtio specifictation v1.1. - 5.1.5
 			mtu = if dev_cfg.features.contains(virtio::net::F::MTU) {
-				dev_cfg.raw.as_ptr().mtu().read().to_ne()
+				// smoltcp expects Ethernet MTU but virtio-net provides the IP MTU
+				u16::try_from(ETHERNET_HEADER_LEN).unwrap() + dev_cfg.raw.as_ptr().mtu().read().to_ne()
 			} else if let Some(my_mtu) = hermit_var!("HERMIT_MTU") {
 				u16::from_str(&my_mtu).unwrap()
 			} else {
@@ -666,6 +671,7 @@ impl VirtioNetDriver {
 					&notif_cfg,
 					&dev_cfg,
 					virtqueue_pairs,
+					mtu,
 				);
 				send_vqs = TxQueues::new::<PackedVq>(
 					&mut com_cfg,
@@ -685,6 +691,7 @@ impl VirtioNetDriver {
 					&notif_cfg,
 					&dev_cfg,
 					virtqueue_pairs,
+					mtu,
 				);
 				send_vqs = TxQueues::new::<SplitVq>(
 					&mut com_cfg,
