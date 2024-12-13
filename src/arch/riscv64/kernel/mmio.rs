@@ -37,6 +37,8 @@ pub(crate) fn register_driver(drv: MmioDriver) {
 }
 
 #[cfg(feature = "gem-net")]
+pub(crate) type NetworkDriverType = GEMDriver;
+#[cfg(feature = "gem-net")]
 pub(crate) fn get_network_driver() -> Option<&'static InterruptSpinMutex<GEMDriver>> {
 	MMIO_DRIVERS
 		.get()?
@@ -44,6 +46,8 @@ pub(crate) fn get_network_driver() -> Option<&'static InterruptSpinMutex<GEMDriv
 		.find_map(|drv| drv.get_network_driver())
 }
 
+#[cfg(not(feature = "gem-net"))]
+pub(crate) type NetworkDriverType = VirtioNetDriver;
 #[cfg(not(feature = "gem-net"))]
 pub(crate) fn get_network_driver() -> Option<&'static InterruptSpinMutex<VirtioNetDriver>> {
 	MMIO_DRIVERS

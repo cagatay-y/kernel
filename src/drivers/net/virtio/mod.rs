@@ -16,7 +16,7 @@ use core::mem::MaybeUninit;
 use core::str::FromStr;
 
 use constants::MAX_VQ_PAIRS;
-use smoltcp::phy::{Checksum, ChecksumCapabilities};
+use smoltcp::phy::{Checksum, ChecksumCapabilities, DeviceCapabilities};
 use smoltcp::wire::{EthernetFrame, Ipv4Packet, Ipv6Packet, ETHERNET_HEADER_LEN};
 use virtio::net::{ConfigVolatileFieldAccess, Hdr, HdrF};
 use virtio::{DeviceConfigSpace, FeatureBits};
@@ -36,7 +36,6 @@ use crate::drivers::virtio::virtqueue::{
 	AvailBufferToken, BufferElem, BufferType, UsedBufferToken, Virtq, VqIndex, VqSize,
 };
 use crate::drivers::{Driver, InterruptLine};
-use crate::executor::device::{RxToken, TxToken};
 use crate::mm::device_alloc::DeviceAlloc;
 
 /// A wrapper struct for the raw configuration structure.
@@ -292,102 +291,6 @@ impl NetworkDriver for VirtioNetDriver {
 		}
 	}
 
-	/// Returns the current MTU of the device.
-	fn get_mtu(&self) -> u16 {
-		self.mtu
-	}
-
-	fn get_checksums(&self) -> ChecksumCapabilities {
-		self.checksums.clone()
-	}
-
-	#[allow(dead_code)]
-	fn has_packet(&self) -> bool {
-		self.recv_vqs.has_packet()
-	}
-
-	/// Provides smoltcp a slice to copy the IP packet and transfer the packet
-	/// to the send queue.
-	fn send_packet<R, F>(&mut self, len: usize, f: F) -> R
-	where
-		F: FnOnce(&mut [u8]) -> R,
-	{
-		// We need to poll to get the queue to remove elements from the table and make space for
-		// what we are about to add
-		self.send_vqs.poll();
-
-		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
-		let result = unsafe {
-			let result = f(MaybeUninit::slice_assume_init_mut(
-				packet.spare_capacity_mut(),
-			));
-			packet.set_len(len);
-			result
-		};
-
-		let mut header = Box::new_in(<Hdr as Default>::default(), DeviceAlloc);
-
-		if let Some((ip_header_len, csum_offset)) = self.should_request_checksum(&mut packet) {
-			header.flags = HdrF::NEEDS_CSUM;
-			header.csum_start =
-				(u16::try_from(ETHERNET_HEADER_LEN).unwrap() + ip_header_len).into();
-			header.csum_offset = csum_offset.into();
-		}
-
-		let buff_tkn = AvailBufferToken::new(
-			vec![BufferElem::Sized(header), BufferElem::Vector(packet)],
-			vec![],
-		)
-		.unwrap();
-
-		self.send_vqs.vqs[0]
-			.dispatch(buff_tkn, false, BufferType::Direct)
-			.unwrap();
-
-		result
-	}
-
-	fn receive_packet(&mut self) -> Option<(RxToken, TxToken)> {
-		let mut buffer_tkn = self.recv_vqs.get_next()?;
-		RxQueues::post_processing(&mut buffer_tkn)
-			.inspect_err(|vnet_err| warn!("Post processing failed. Err: {vnet_err:?}"))
-			.ok()?;
-		let first_header = buffer_tkn.used_recv_buff.pop_front_downcast::<Hdr>()?;
-		let first_packet = buffer_tkn.used_recv_buff.pop_front_vec()?;
-		trace!("Header: {first_header:?}");
-
-		// According to VIRTIO spec v1.2 sec. 5.1.6.3.2, "num_buffers will always be 1 if VIRTIO_NET_F_MRG_RXBUF is not negotiated."
-		// Unfortunately, NVIDIA MLX5 does not comply with this requirement and we have to manually set the value to the correct one.
-		let num_buffers = if self.dev_cfg.features.contains(virtio::net::F::MRG_RXBUF) {
-			first_header.num_buffers.to_ne()
-		} else {
-			1
-		};
-
-		let mut packets = Vec::with_capacity(num_buffers.into());
-		packets.push(first_packet);
-
-		for _ in 1..num_buffers {
-			let mut buffer_tkn = self.recv_vqs.get_next().unwrap();
-			RxQueues::post_processing(&mut buffer_tkn)
-				.inspect_err(|vnet_err| warn!("Post processing failed. Err: {vnet_err:?}"))
-				.ok()?;
-			let _header = buffer_tkn.used_recv_buff.pop_front_downcast::<Hdr>()?;
-			let packet = buffer_tkn.used_recv_buff.pop_front_vec()?;
-			packets.push(packet);
-		}
-
-		fill_queue(
-			self.recv_vqs.vqs[0].as_mut(),
-			num_buffers,
-			self.recv_vqs.payload_element_size,
-		);
-
-		let vec_data = packets.into_iter().flatten().collect();
-
-		Some((RxToken::new(vec_data), TxToken::new()))
-	}
-
 	fn set_polling_mode(&mut self, value: bool) {
 		if value {
 			self.disable_interrupts();
@@ -422,6 +325,229 @@ impl Driver for VirtioNetDriver {
 
 	fn get_name(&self) -> &'static str {
 		"virtio"
+	}
+}
+
+impl smoltcp::phy::Device for VirtioNetDriver {
+	type TxToken<'a> = TxToken<'a>;
+	type RxToken<'a> = RxToken<'a>;
+
+	fn capabilities(&self) -> DeviceCapabilities {
+		let mut device_capabilities = DeviceCapabilities::default();
+		device_capabilities.medium = smoltcp::phy::Medium::Ethernet;
+		device_capabilities.max_transmission_unit = self.mtu.into();
+		device_capabilities.max_burst_size = Some(constants::NUM_PACKETS.into());
+		device_capabilities.checksum = self.checksums.clone();
+		device_capabilities
+	}
+
+	fn receive(
+		&mut self,
+		_timestamp: smoltcp::time::Instant,
+	) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+		if self.recv_vqs.has_packet() {
+			Some((
+				RxToken {
+					receive_queue: &mut self.recv_vqs,
+					is_mrg_rxbuf_enabled: self.dev_cfg.features.contains(virtio::net::F::MRG_RXBUF),
+				},
+				TxToken {
+					transmit_queue: &mut self.send_vqs,
+					checksums: self.checksums.clone(),
+				},
+			))
+		} else {
+			None
+		}
+	}
+
+	fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
+		Some(TxToken {
+			transmit_queue: &mut self.send_vqs,
+			checksums: self.checksums.clone(),
+		})
+	}
+}
+
+pub struct TxToken<'a> {
+	transmit_queue: &'a mut TxQueues,
+	checksums: ChecksumCapabilities,
+}
+
+impl TxToken<'_> {
+	/// Sets the TCP or UDP checksum field to the checksum of the psuedo-header if necessary or returns None otherwise.
+	fn should_request_checksum<T: AsRef<[u8]> + AsMut<[u8]>>(
+		checksums: &ChecksumCapabilities,
+		frame: T,
+	) -> Option<(u16, u16)> {
+		if !checksums.tcp.tx() || !checksums.udp.tx() {
+			// If a checksum calculation by the host is necessary, we have to inform the host within the header
+			// see Virtio specification 5.1.6.2
+			let mut ethernet_frame = EthernetFrame::new_unchecked(frame);
+			// If the Ethernet protocol is not one of these two, we default to not asking for checksum,
+			// as otherwise the frame will be corrupted by the device trying to write the checksum.
+			if let ip @ (smoltcp::wire::EthernetProtocol::Ipv4
+			| smoltcp::wire::EthernetProtocol::Ipv6) = ethernet_frame.ethertype()
+			{
+				let ip_header_len: u16;
+				let ip_packet_len: usize;
+				let protocol;
+				let pseudo_header_checksum;
+				match ip {
+					smoltcp::wire::EthernetProtocol::Ipv4 => {
+						let ip_packet = Ipv4Packet::new_unchecked(&*ethernet_frame.payload_mut());
+						ip_header_len = ip_packet.header_len().into();
+						ip_packet_len = ip_packet.total_len().into();
+						protocol = ip_packet.next_header();
+						pseudo_header_checksum =
+							partial_checksum::ipv4_pseudo_header_partial_checksum(&ip_packet);
+					}
+					smoltcp::wire::EthernetProtocol::Ipv6 => {
+						let ip_packet = Ipv6Packet::new_unchecked(&*ethernet_frame.payload_mut());
+						ip_header_len = ip_packet.header_len().try_into().expect(
+								"VIRTIO does not support IP headers that are longer than u16::MAX bytes.",
+							);
+						ip_packet_len = ip_packet.total_len();
+						protocol = ip_packet.next_header();
+						pseudo_header_checksum =
+							partial_checksum::ipv6_pseudo_header_partial_checksum(&ip_packet);
+					}
+					_ => unreachable!(),
+				}
+				// Like the Ethernet protocol check, we check for IP protocols for which we know the location of the checksum field.
+				if let smoltcp::wire::IpProtocol::Tcp | smoltcp::wire::IpProtocol::Udp = protocol {
+					let ip_payload =
+						&mut ethernet_frame.payload_mut()[ip_header_len.into()..ip_packet_len];
+
+					// We do not care about the offset of the checksum for the protocol if we don't require checksum
+					// from the host, so we use None to signal that checksum from the host is not neeeded.
+					let csum_offset = match protocol {
+						smoltcp::wire::IpProtocol::Tcp => {
+							if !checksums.tcp.tx() {
+								let mut tcp_packet =
+									smoltcp::wire::TcpPacket::new_unchecked(ip_payload);
+								tcp_packet.set_checksum(pseudo_header_checksum);
+								Some(16)
+							} else {
+								None
+							}
+						}
+						smoltcp::wire::IpProtocol::Udp => {
+							if !checksums.tcp.tx() {
+								let mut udp_packet =
+									smoltcp::wire::UdpPacket::new_unchecked(ip_payload);
+								udp_packet.set_checksum(pseudo_header_checksum);
+								Some(6)
+							} else {
+								None
+							}
+						}
+						_ => None,
+					};
+					csum_offset.map(|csum_offset| (ip_header_len, csum_offset))
+				} else {
+					None
+				}
+			} else {
+				None
+			}
+		} else {
+			None
+		}
+	}
+}
+
+impl smoltcp::phy::TxToken for TxToken<'_> {
+	fn consume<R, F>(self, len: usize, f: F) -> R
+	where
+		F: FnOnce(&mut [u8]) -> R,
+	{
+		// We need to poll to get the queue to remove elements from the table and make space for
+		// what we are about to add
+		self.transmit_queue.poll();
+
+		let mut packet = Vec::with_capacity_in(len, DeviceAlloc);
+		let result = unsafe {
+			let result = f(MaybeUninit::slice_assume_init_mut(
+				packet.spare_capacity_mut(),
+			));
+			packet.set_len(len);
+			result
+		};
+
+		let mut header = Box::new_in(<Hdr as Default>::default(), DeviceAlloc);
+
+		if let Some((ip_header_len, csum_offset)) =
+			Self::should_request_checksum(&self.checksums, &mut packet)
+		{
+			header.flags = HdrF::NEEDS_CSUM;
+			header.csum_start =
+				(u16::try_from(ETHERNET_HEADER_LEN).unwrap() + ip_header_len).into();
+			header.csum_offset = csum_offset.into();
+		}
+
+		let buff_tkn = AvailBufferToken::new(
+			vec![BufferElem::Sized(header), BufferElem::Vector(packet)],
+			vec![],
+		)
+		.unwrap();
+
+		self.transmit_queue.vqs[0]
+			.dispatch(buff_tkn, false, BufferType::Direct)
+			.unwrap();
+
+		result
+	}
+}
+pub struct RxToken<'a> {
+	receive_queue: &'a mut RxQueues,
+	is_mrg_rxbuf_enabled: bool,
+}
+
+impl smoltcp::phy::RxToken for RxToken<'_> {
+	fn consume<R, F>(self, f: F) -> R
+	where
+		F: FnOnce(&[u8]) -> R,
+	{
+		let mut buffer_tkn = self.receive_queue.get_next().unwrap();
+		RxQueues::post_processing(&mut buffer_tkn).expect("Post processing failed.");
+		let first_header = buffer_tkn
+			.used_recv_buff
+			.pop_front_downcast::<Hdr>()
+			.unwrap();
+		let first_packet = buffer_tkn.used_recv_buff.pop_front_vec().unwrap();
+		trace!("Header: {first_header:?}");
+
+		// According to VIRTIO spec v1.2 sec. 5.1.6.3.2, "num_buffers will always be 1 if VIRTIO_NET_F_MRG_RXBUF is not negotiated."
+		// Unfortunately, NVIDIA MLX5 does not comply with this requirement and we have to manually set the value to the correct one.
+		let num_buffers = if self.is_mrg_rxbuf_enabled {
+			first_header.num_buffers.to_ne()
+		} else {
+			1
+		};
+
+		let mut packets = Vec::with_capacity(num_buffers.into());
+		packets.push(first_packet);
+
+		for _ in 1..num_buffers {
+			let mut buffer_tkn = self.receive_queue.get_next().unwrap();
+			RxQueues::post_processing(&mut buffer_tkn).expect("Post processing failed.");
+			let _header = buffer_tkn
+				.used_recv_buff
+				.pop_front_downcast::<Hdr>()
+				.unwrap();
+			let packet = buffer_tkn.used_recv_buff.pop_front_vec().unwrap();
+			packets.push(packet);
+		}
+
+		fill_queue(
+			self.receive_queue.vqs[0].as_mut(),
+			num_buffers,
+			self.receive_queue.payload_element_size,
+		);
+
+		let mut vec_data: Vec<_> = packets.into_iter().flatten().collect();
+		f(vec_data.as_mut())
 	}
 }
 
@@ -848,8 +974,13 @@ impl VirtioNetDriver {
 }
 
 pub mod constants {
+	use super::VIRTIO_MAX_QUEUE_SIZE;
+
 	// Configuration constants
 	pub const MAX_VQ_PAIRS: u16 = 1;
+	pub(super) const BUFF_PER_PACKET: u16 = 2;
+	pub(super) const QUEUE_SIZE: u16 = VIRTIO_MAX_QUEUE_SIZE;
+	pub(super) const NUM_PACKETS: u16 = QUEUE_SIZE / BUFF_PER_PACKET;
 }
 
 /// Error module of virtios network driver. Containing the (VirtioNetError)[VirtioNetError]

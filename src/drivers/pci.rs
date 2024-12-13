@@ -441,6 +441,8 @@ pub(crate) fn get_interrupt_handlers() -> HashMap<InterruptLine, InterruptHandle
 }
 
 #[cfg(all(not(feature = "rtl8139"), any(feature = "tcp", feature = "udp")))]
+pub(crate) type NetworkDriverType = VirtioNetDriver;
+#[cfg(all(not(feature = "rtl8139"), any(feature = "tcp", feature = "udp")))]
 pub(crate) fn get_network_driver() -> Option<&'static InterruptTicketMutex<VirtioNetDriver>> {
 	PCI_DRIVERS
 		.get()?
@@ -448,6 +450,8 @@ pub(crate) fn get_network_driver() -> Option<&'static InterruptTicketMutex<Virti
 		.find_map(|drv| drv.get_network_driver())
 }
 
+#[cfg(all(feature = "rtl8139", any(feature = "tcp", feature = "udp")))]
+pub(crate) type NetworkDriverType = RTL8139Driver;
 #[cfg(all(feature = "rtl8139", any(feature = "tcp", feature = "udp")))]
 pub(crate) fn get_network_driver() -> Option<&'static InterruptTicketMutex<RTL8139Driver>> {
 	PCI_DRIVERS

@@ -194,6 +194,7 @@ pub(crate) fn register_driver(drv: MmioDriver) {
 	MMIO_DRIVERS.with(|mmio_drivers| mmio_drivers.unwrap().push(drv));
 }
 
+pub(crate) type NetworkDriverType = VirtioNetDriver;
 pub(crate) fn get_network_driver() -> Option<&'static InterruptTicketMutex<VirtioNetDriver>> {
 	MMIO_DRIVERS
 		.get()?

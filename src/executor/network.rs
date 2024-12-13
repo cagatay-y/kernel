@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 #[cfg(feature = "dns")]
 use alloc::vec::Vec;
 use core::future;
+use core::ops::DerefMut;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::task::Poll;
 
@@ -23,7 +24,10 @@ use smoltcp::wire::{DnsQueryType, IpAddress};
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
 use crate::arch;
-use crate::executor::device::HermitNet;
+#[cfg(not(feature = "pci"))]
+use crate::arch::kernel::mmio as hardware;
+#[cfg(feature = "pci")]
+use crate::drivers::pci as hardware;
 use crate::executor::spawn;
 #[cfg(feature = "dns")]
 use crate::io;
@@ -53,7 +57,7 @@ pub(crate) static NIC: InterruptTicketMutex<NetworkState<'_>> =
 pub(crate) struct NetworkInterface<'a> {
 	pub(super) iface: smoltcp::iface::Interface,
 	pub(super) sockets: SocketSet<'a>,
-	pub(super) device: HermitNet,
+	pub(super) device: &'static InterruptTicketMutex<hardware::NetworkDriverType>,
 	#[cfg(feature = "dhcpv4")]
 	pub(super) dhcp_handle: SocketHandle,
 	#[cfg(feature = "dns")]
@@ -265,7 +269,7 @@ impl<'a> NetworkInterface<'a> {
 
 	pub(crate) fn poll_common(&mut self, timestamp: Instant) -> PollResult {
 		self.iface
-			.poll(timestamp, &mut self.device, &mut self.sockets)
+			.poll(timestamp, self.device.lock().deref_mut(), &mut self.sockets)
 	}
 
 	pub(crate) fn poll_delay(&mut self, timestamp: Instant) -> Option<Duration> {
