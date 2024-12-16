@@ -345,7 +345,7 @@ impl smoltcp::phy::Device for VirtioNetDriver {
 		&mut self,
 		_timestamp: smoltcp::time::Instant,
 	) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-		if self.recv_vqs.has_packet() {
+		if self.recv_vqs.has_packet() && self.can_send() {
 			Some((
 				RxToken {
 					receive_queue: &mut self.recv_vqs,
@@ -362,10 +362,14 @@ impl smoltcp::phy::Device for VirtioNetDriver {
 	}
 
 	fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-		Some(TxToken {
-			transmit_queue: &mut self.send_vqs,
-			checksums: self.checksums.clone(),
-		})
+		if self.can_send() {
+			Some(TxToken {
+				transmit_queue: &mut self.send_vqs,
+				checksums: self.checksums.clone(),
+			})
+		} else {
+			None
+		}
 	}
 }
 
@@ -970,6 +974,14 @@ impl VirtioNetDriver {
 		} else {
 			None
 		}
+	}
+
+	/// Returns if the send queue has enough space to place a send buffer.
+	/// The return value may be misleading if a second query is done before
+	/// the first one actually consumes the spaces promised, as the queue currently
+	/// relies on the number of actually used descriptor spaces to make the determination. 
+	fn can_send(&mut self) -> bool {
+		self.send_vqs.vqs[0].has_space(constants::BUFF_PER_PACKET)
 	}
 }
 

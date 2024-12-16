@@ -208,6 +208,9 @@ pub trait Virtq: Send {
 	fn index(&self) -> VqIndex;
 
 	fn has_used_buffers(&self) -> bool;
+
+	/// Returns if the queue has enough space for the specified number of new descriptors
+	fn has_space(&self, descriptor_count: u16) -> bool;
 }
 
 /// These methods are an implementation detail and are meant only for consumption by the default method

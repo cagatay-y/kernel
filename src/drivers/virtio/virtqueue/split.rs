@@ -311,6 +311,10 @@ impl Virtq for SplitVq {
 	fn has_used_buffers(&self) -> bool {
 		self.ring.read_idx != self.ring.used_ring().idx.to_ne()
 	}
+
+	fn has_space(&self, descriptor_count: u16) -> bool {
+		self.ring.mem_pool.pool.len() >= descriptor_count.into()
+	}
 }
 
 impl VirtqPrivate for SplitVq {

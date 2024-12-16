@@ -736,6 +736,10 @@ impl Virtq for PackedVq {
 		let desc = &self.descr_ring.ring[usize::from(self.descr_ring.poll_index)];
 		self.descr_ring.is_marked_used(desc.flags)
 	}
+
+	fn has_space(&self, _descriptor_count: u16) -> bool {
+		unimplemented!()
+	}
 }
 
 impl VirtqPrivate for PackedVq {
